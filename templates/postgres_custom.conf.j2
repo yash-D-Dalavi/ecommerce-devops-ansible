@@ -1,0 +1,6 @@
+# {{ ansible_managed }}
+listen_addresses = '{{ db_listen_addresses }}'
+port = {{ db_port }}
+max_connections = {{ db_max_connections }}
+shared_buffers = {{ db_shared_buffers }}
+log_connections = on

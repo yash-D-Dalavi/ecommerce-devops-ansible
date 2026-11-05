@@ -1,0 +1,9 @@
+---
+app_name: ecommerce-platform
+app_base_dir: /opt/ecommerce
+docker_network: ecommerce_net
+env_name: production
+db_password: "EcomPassword2026"
+grafana_admin_password: "GrafanaAdmin2026"
+deploy_from_git: false
+app_repo_url: "https://github.com/yash-D-Dalavi/ecommerce-devops-ansible.git"

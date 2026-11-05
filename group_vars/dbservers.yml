@@ -1,0 +1,7 @@
+---
+db_name: ecommerce_db
+db_user: ecom_user
+db_port: 5432
+db_listen_addresses: localhost
+db_max_connections: 100
+db_shared_buffers: 128MB

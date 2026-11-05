@@ -1,0 +1,8 @@
+---
+prometheus_port: 9090
+grafana_port: 3000
+node_exporter_port: 9100
+monitoring_dir: /opt/monitoring
+prometheus_image: "prom/prometheus:v2.53.0"
+grafana_image: "grafana/grafana:11.1.0"
+node_exporter_image: "prom/node-exporter:v1.8.2"

@@ -1,0 +1,394 @@
+---
+# E-Commerce Platform - Ansible Deployment
+# Tags: common | db | web | monitor
+
+# ---------------- PLAY 1: Common prerequisites + Docker ----------------
+- name: PLAY 1 - Common prerequisites and Docker engine
+  hosts: production
+  become: true
+  gather_facts: true
+  tags: ["common"]
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - git
+          - ca-certificates
+          - docker.io
+          - python3-docker
+        state: present
+
+    - name: Install Docker Compose plugin (Ubuntu 24.04 and above)
+      ansible.builtin.apt:
+        name: docker-compose-v2
+        state: present
+      when: ansible_distribution_version is version('24.04', '>=')
+
+    - name: Ensure /etc/docker exists
+      ansible.builtin.file:
+        path: /etc/docker
+        state: directory
+        mode: "0755"
+
+    - name: Configure Docker log rotation
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" }
+          }
+      notify: Restart Docker
+
+    - name: Start and enable Docker service
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Apply pending handlers before using Docker
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check Docker Compose availability (informational)
+      ansible.builtin.command: docker compose version
+      register: compose_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Create shared Docker network
+      community.docker.docker_network:
+        name: "{{ docker_network }}"
+        state: present
+
+  handlers:
+    - name: Restart Docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+
+# ---------------- PLAY 2: Database tier ----------------
+- name: PLAY 2 - PostgreSQL database setup and security initialization
+  hosts: dbservers
+  become: true
+  tags: ["db"]
+
+  tasks:
+    - name: Install PostgreSQL and helper packages
+      ansible.builtin.apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - python3-psycopg2
+          - acl
+        state: present
+
+    - name: Ensure PostgreSQL service is running
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Detect installed PostgreSQL version
+      ansible.builtin.find:
+        paths: /etc/postgresql
+        file_type: directory
+        recurse: false
+      register: pg_dirs
+
+    - name: Set PostgreSQL version fact
+      ansible.builtin.set_fact:
+        pg_version: "{{ (pg_dirs.files | first).path | basename }}"
+
+    - name: Ensure conf.d directory exists
+      ansible.builtin.file:
+        path: "/etc/postgresql/{{ pg_version }}/main/conf.d"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0755"
+
+    - name: Apply hardened PostgreSQL configuration
+      ansible.builtin.template:
+        src: postgres_custom.conf.j2
+        dest: "/etc/postgresql/{{ pg_version }}/main/conf.d/ecommerce.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+      notify: Restart PostgreSQL
+
+    - name: Apply pending handlers (restart PostgreSQL if config changed)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Database and user provisioning
+      become: true
+      become_user: postgres
+      block:
+        - name: Create application database user (no superuser rights)
+          community.postgresql.postgresql_user:
+            name: "{{ db_user }}"
+            password: "{{ db_password }}"
+            role_attr_flags: NOSUPERUSER,NOCREATEDB,NOCREATEROLE
+            state: present
+          no_log: true
+
+        - name: Create application database
+          community.postgresql.postgresql_db:
+            name: "{{ db_name }}"
+            owner: "{{ db_user }}"
+            state: present
+
+        - name: Create users table
+          community.postgresql.postgresql_table:
+            db: "{{ db_name }}"
+            name: users
+            owner: "{{ db_user }}"
+            columns:
+              - id serial PRIMARY KEY
+              - email varchar(120) UNIQUE NOT NULL
+              - created_at timestamp DEFAULT now()
+
+        - name: Create orders table
+          community.postgresql.postgresql_table:
+            db: "{{ db_name }}"
+            name: orders
+            owner: "{{ db_user }}"
+            columns:
+              - id serial PRIMARY KEY
+              - user_id integer NOT NULL
+              - amount numeric(10,2) NOT NULL
+              - created_at timestamp DEFAULT now()
+
+    - name: Verify PostgreSQL is accepting connections
+      ansible.builtin.command: "pg_isready -h 127.0.0.1 -p {{ db_port }}"
+      register: pg_check
+      changed_when: false
+      failed_when: "'accepting connections' not in pg_check.stdout"
+
+  handlers:
+    - name: Restart PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+# ---------------- PLAY 3: Web tier ----------------
+- name: PLAY 3 - Nginx reverse proxy and containerized microservices
+  hosts: webservers
+  become: true
+  tags: ["web"]
+
+  tasks:
+    - name: Install Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Create application directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ app_base_dir }}"
+        - "{{ web_root }}"
+
+    - name: Clone application repository (optional, deploy_from_git=true)
+      ansible.builtin.git:
+        repo: "{{ app_repo_url }}"
+        dest: "{{ app_base_dir }}/src"
+        version: main
+      when: deploy_from_git | bool
+
+    - name: Deploy User Service container
+      community.docker.docker_container:
+        name: ecommerce_user_service
+        image: "{{ user_service_image }}"
+        state: started
+        restart_policy: unless-stopped
+        command:
+          - "-listen=:5678"
+          - '-text={"service":"user-service","status":"UP"}'
+        published_ports:
+          - "127.0.0.1:{{ user_service_port }}:5678"
+        networks:
+          - name: "{{ docker_network }}"
+
+    - name: Deploy Order Service container
+      community.docker.docker_container:
+        name: ecommerce_order_service
+        image: "{{ order_service_image }}"
+        state: started
+        restart_policy: unless-stopped
+        command:
+          - "-listen=:5678"
+          - '-text={"service":"order-service","status":"UP"}'
+        published_ports:
+          - "127.0.0.1:{{ order_service_port }}:5678"
+        networks:
+          - name: "{{ docker_network }}"
+
+    - name: Deploy storefront landing page
+      ansible.builtin.template:
+        src: index.html.j2
+        dest: "{{ web_root }}/index.html"
+        mode: "0644"
+
+    - name: Configure Nginx reverse proxy site
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/sites-available/ecommerce.conf
+        mode: "0644"
+      notify: Restart Nginx
+
+    - name: Enable the ecommerce site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/ecommerce.conf
+        dest: /etc/nginx/sites-enabled/ecommerce.conf
+        state: link
+      notify: Restart Nginx
+
+    - name: Disable default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Restart Nginx
+
+    - name: Validate Nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Start and enable Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Apply pending handlers (restart Nginx if config changed)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify storefront is reachable through Nginx
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ nginx_http_port }}/"
+        status_code: 200
+      register: web_check
+      retries: 5
+      delay: 3
+      until: web_check.status == 200
+      changed_when: false
+
+    - name: Verify reverse proxy to User Service
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ nginx_http_port }}/api/users/"
+        status_code: 200
+      register: proxy_check
+      retries: 5
+      delay: 3
+      until: proxy_check.status == 200
+      changed_when: false
+
+  handlers:
+    - name: Restart Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+
+# ---------------- PLAY 4: Monitoring tier ----------------
+- name: PLAY 4 - Monitoring with Prometheus, Node Exporter and Grafana
+  hosts: monitoring
+  become: true
+  tags: ["monitor"]
+
+  tasks:
+    - name: Create monitoring directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ monitoring_dir }}/prometheus"
+        - "{{ monitoring_dir }}/grafana/provisioning/datasources"
+
+    - name: Render Prometheus configuration
+      ansible.builtin.template:
+        src: prometheus.yml.j2
+        dest: "{{ monitoring_dir }}/prometheus/prometheus.yml"
+        mode: "0644"
+      notify: Restart Prometheus
+
+    - name: Render Grafana datasource provisioning file
+      ansible.builtin.template:
+        src: grafana_datasource.yml.j2
+        dest: "{{ monitoring_dir }}/grafana/provisioning/datasources/datasource.yml"
+        mode: "0644"
+
+    - name: Run Node Exporter container
+      community.docker.docker_container:
+        name: node_exporter
+        image: "{{ node_exporter_image }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        pid_mode: host
+        command:
+          - "--web.listen-address=:{{ node_exporter_port }}"
+
+    - name: Run Prometheus container
+      community.docker.docker_container:
+        name: prometheus
+        image: "{{ prometheus_image }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        command:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--storage.tsdb.path=/prometheus"
+          - "--web.listen-address=:{{ prometheus_port }}"
+        volumes:
+          - "{{ monitoring_dir }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+          - "prometheus_data:/prometheus"
+
+    - name: Run Grafana container
+      community.docker.docker_container:
+        name: grafana
+        image: "{{ grafana_image }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        env:
+          GF_SERVER_HTTP_PORT: "{{ grafana_port | string }}"
+          GF_SECURITY_ADMIN_USER: "admin"
+          GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_admin_password }}"
+        volumes:
+          - "{{ monitoring_dir }}/grafana/provisioning/datasources/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro"
+          - "grafana_data:/var/lib/grafana"
+
+    - name: Wait for Prometheus to be ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ prometheus_port }}/-/ready"
+        status_code: 200
+      register: prom_check
+      retries: 10
+      delay: 5
+      until: prom_check.status == 200
+      changed_when: false
+
+    - name: Wait for Grafana to be healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ grafana_port }}/api/health"
+        status_code: 200
+      register: graf_check
+      retries: 15
+      delay: 5
+      until: graf_check.status == 200
+      changed_when: false
+
+  handlers:
+    - name: Restart Prometheus
+      ansible.builtin.command: docker restart prometheus

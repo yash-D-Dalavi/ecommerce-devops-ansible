@@ -1,0 +1,8 @@
+---
+server_name: localhost
+web_root: /var/www/ecommerce
+nginx_http_port: 8080
+user_service_port: 8001
+order_service_port: 8002
+user_service_image: "hashicorp/http-echo:1.0"
+order_service_image: "hashicorp/http-echo:1.0"
